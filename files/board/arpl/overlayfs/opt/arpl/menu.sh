@@ -30,8 +30,11 @@ LKM="$(readConfigKey "lkm" "${USER_CONFIG_FILE}")"
 DSMLOGO="$(readConfigKey "dsmlogo" "${USER_CONFIG_FILE}")"
 DIRECTBOOT="$(readConfigKey "directboot" "${USER_CONFIG_FILE}")"
 NOTSETMACS="$(readConfigKey "notsetmacs" "${USER_CONFIG_FILE}")"
+PRERELEASE="$(readConfigKey "prerelease" "${USER_CONFIG_FILE}")"
 BOOTWAIT="$(readConfigKey "bootwait" "${USER_CONFIG_FILE}")"
+BOOTIPWAIT="$(readConfigKey "bootipwait" "${USER_CONFIG_FILE}")"
 KERNELWAY="$(readConfigKey "kernelway" "${USER_CONFIG_FILE}")"
+ODP="$(readConfigKey "odp" "${USER_CONFIG_FILE}")"  # official drivers priorities
 SN="$(readConfigKey "sn" "${USER_CONFIG_FILE}")"
 
 ###############################################################################
@@ -184,9 +187,10 @@ function productversMenu() {
       --infobox "$(TEXT "Get pat data ..")" 0 0
     idx=0
     while [ ${idx} -le 3 ]; do # Loop 3 times, if successful, break
-      speed_a=$(ping -c 1 -W 5 www.synology.com | awk '/time=/ {print $7}' | cut -d '=' -f 2)
-      speed_b=$(ping -c 1 -W 5 www.synology.cn | awk '/time=/ {print $7}' | cut -d '=' -f 2)
-      fastest="$(echo -e "https://www.synology.com/api/support/findDownloadInfo?lang=en-us ${speed_a:-999}\nhttps://www.synology.cn/api/support/findDownloadInfo?lang=zh-cn ${speed_b:-999}" | sort -k2n | head -1 | awk '{print $1}')"
+      fastest=$(_get_fastest "www.synology.com" "www.synology.cn")
+      [ "${fastest}" = "www.synology.cn" ] &&
+        fastest="https://www.synology.cn/api/support/findDownloadInfo?lang=zh-cn" ||
+        fastest="https://www.synology.com/api/support/findDownloadInfo?lang=en-us"
       patdata=$(curl -skL "${fastest}&product=${MODEL/+/%2B}&major=${resp%%.*}&minor=${resp##*.}")
       if [ "$(echo ${patdata} | jq -r '.success' 2>/dev/null)" = "true" ]; then
         if echo ${patdata} | jq -r '.info.system.detail[0].items[0].files[0].label_ext' 2>/dev/null | grep -q 'pat'; then
@@ -418,6 +422,7 @@ function moduleMenu() {
       d "$(TEXT "Deselect all modules")" \
       c "$(TEXT "Choose modules to include")" \
       o "$(TEXT "Upload a external module")" \
+      p "$(TEXT "Priority use of official drivers:") \Z4${ODP}\Zn" \
       e "$(TEXT "Exit")" \
       2>${TMP_PATH}/resp
     [ $? -ne 0 ] && break
@@ -525,6 +530,10 @@ function moduleMenu() {
         dialog --backtitle "$(backtitle)" --colors --title "$(TEXT "Modules")" \
           --msgbox "$(TEXT "Not a valid file, please try again!")" 0 0
       fi
+      ;;
+    p)
+      [ "${ODP}" = "false" ] && ODP='true' || ODP='false'
+      writeConfigKey "odp" "${ODP}" "${USER_CONFIG_FILE}"
       ;;
     e)
       break
@@ -771,14 +780,7 @@ function extractDsmFiles() {
       rm -rf "${CACHE_PATH}/dl"
     fi
     mkdir -p "${CACHE_PATH}/dl"
-
-    mirrors=("global.synologydownload.com" "global.download.synology.com" "cndl.synology.cn")
-    mirrorspeeds=""
-    for I in ${mirrors[@]}; do
-      speed=$(ping -c 1 -W 5 ${I} | awk '/time=/ {print $7}' | cut -d '=' -f 2)
-      mirrorspeeds+="${I} ${speed:-999}\n"
-    done
-    fastest="$(echo -e "${mirrorspeeds}" | tr -s '\n' | sort -k2n | head -1 | awk '{print $1}')"
+    fastest=$(_get_fastest "global.synologydownload.com" "global.download.synology.com" "cndl.synology.cn")
     mirror="$(echo ${PATURL} | sed 's|^http[s]*://\([^/]*\).*|\1|')"
     if echo "${mirrors[@]}" | grep -wq "${mirror}" && [ "${mirror}" != "${fastest}" ]; then
       echo "$(printf "$(TEXT "Based on the current network situation, switch to %s mirror to downloading.")" "${fastest}")"
@@ -927,7 +929,8 @@ function extractDsmFiles() {
 function getLogo() {
   rm -f "${CACHE_PATH}/logo.png"
   if [ "${DSMLOGO}" = "true" ]; then
-    STATUS=$(curl -skL -w "%{http_code}" "https://www.synology.com/api/products/getPhoto?product=${MODEL/+/%2B}&type=img_s&sort=0" -o "${CACHE_PATH}/logo.png")
+    fastest=$(_get_fastest "www.synology.com" "www.synology.cn")
+    STATUS=$(curl -skL -w "%{http_code}" "https://${fastest}/api/products/getPhoto?product=${MODEL/+/%2B}&type=img_s&sort=0" -o "${CACHE_PATH}/logo.png")
     if [ $? -ne 0 -o ${STATUS} -ne 200 -o -f "${CACHE_PATH}/logo.png" ]; then
       convert -rotate 180 "${CACHE_PATH}/logo.png" "${CACHE_PATH}/logo.png" 2>/dev/null
       magick montage "${CACHE_PATH}/logo.png" -background 'none' -tile '3x3' -geometry '350x210' "${CACHE_PATH}/logo.png" 2>/dev/null
@@ -998,6 +1001,7 @@ function advancedMenu() {
     if loaderIsConfigured; then
       echo "q \"$(TEXT "Switch direct boot:") \Z4${DIRECTBOOT}\Zn\"" >>"${TMP_PATH}/menu"
       if [ "${DIRECTBOOT}" = "false" ]; then
+        echo "i \"$(TEXT "Timeout of get ip in boot:") \Z4${BOOTIPWAIT}\Zn\"" >>"${TMP_PATH}/menu"
         echo "w \"$(TEXT "Timeout of boot wait:") \Z4${BOOTWAIT}\Zn\"" >>"${TMP_PATH}/menu"
         echo "k \"$(TEXT "kernel switching method:") \Z4${KERNELWAY}\Zn\"" >>"${TMP_PATH}/menu"
       fi
@@ -1038,6 +1042,18 @@ function advancedMenu() {
     q)
       [ "${DIRECTBOOT}" = "false" ] && DIRECTBOOT='true' || DIRECTBOOT='false'
       writeConfigKey "directboot" "${DIRECTBOOT}" "${USER_CONFIG_FILE}"
+      NEXT="e"
+      ;;
+    i)
+      ITEMS="$(echo -e "1 \n5 \n10 \n30 \n60 \n")"
+      dialog --backtitle "$(backtitle)" --colors --title "$(TEXT "Advanced")" \
+        --default-item "${BOOTIPWAIT}" --no-items --menu "$(TEXT "Choose a waiting time(seconds)")" 0 0 0 ${ITEMS} \
+        2>${TMP_PATH}/resp
+      [ $? -ne 0 ] && return
+      resp=$(cat ${TMP_PATH}/resp 2>/dev/null)
+      [ -z "${resp}" ] && return
+      BOOTIPWAIT=${resp}
+      writeConfigKey "bootipwait" "${BOOTIPWAIT}" "${USER_CONFIG_FILE}"
       NEXT="e"
       ;;
     w)
@@ -1295,7 +1311,7 @@ function advancedMenu() {
         dialog --backtitle "$(backtitle)" --colors --title "$(TEXT "Advanced")" \
           --msgbox "$(TEXT "Not a valid dts file, please try again!")" 0 0
       else
-        mkdir -p "${USER_UP_PATH}"
+        [ -d "{USER_UP_PATH}" ] || mkdir -p "${USER_UP_PATH}"
         cp -f "${USER_FILE}" "${USER_UP_PATH}/${MODEL}.dts"
         dialog --backtitle "$(backtitle)" --colors --title "$(TEXT "Advanced")" \
           --msgbox "$(TEXT "A valid dts file, Automatically import at compile time.")" 0 0
@@ -1553,12 +1569,16 @@ function downloadExts() {
 
   dialog --backtitle "$(backtitle)" --colors --title "${T}" \
     --infobox "$(TEXT "Checking last version")" 0 0
-  # TAG=`curl -skL "${PROXY}https://api.github.com/repos/wjz304/arpl-addons/releases/latest" | grep "tag_name" | awk '{print substr($2, 2, length($2)-3)}'`
-  # In the absence of authentication, the default API access count for GitHub is 60 per hour, so removing the use of api.github.com
-  LATESTURL="$(curl -skL -w %{url_effective} -o /dev/null "${PROXY}${3}/releases/latest")"
-  TAG="${LATESTURL##*/}"
+  if [ "${PRERELEASE}" = "true" ]; then
+    TAG="$(curl -skL "${PROXY}${3}/tags" | grep /refs/tags/.*\.zip | head -1 | sed -r 's/.*\/refs\/tags\/(.*)\.zip.*$/\1/')"
+  else
+    # TAG=`curl -skL "${PROXY}https://api.github.com/repos/wjz304/arpl-addons/releases/latest" | grep "tag_name" | awk '{print substr($2, 2, length($2)-3)}'`
+    # In the absence of authentication, the default API access count for GitHub is 60 per hour, so removing the use of api.github.com
+    LATESTURL="$(curl -skL -w %{url_effective} -o /dev/null "${PROXY}${3}/releases/latest")"
+    TAG="${LATESTURL##*/}"
+  fi
   [ "${TAG:0:1}" = "v" ] && TAG="${TAG:1}"
-  if [ -z "${TAG}" ]; then
+  if [ -z "${TAG}" -o "${TAG}" = "latest" ]; then
     if [ ! "${5}" = "0" ]; then
       dialog --backtitle "$(backtitle)" --colors --title "${T}" \
         --infobox "$(TEXT "Error checking new version")" 0 0
@@ -1708,6 +1728,7 @@ function updateMenu() {
       echo "p \"$(TEXT "Set proxy server")\"" >>"${TMP_PATH}/menu"
     fi
     echo "u \"$(TEXT "Local upload")\"" >>"${TMP_PATH}/menu"
+    echo "b \"$(TEXT "Pre Release:") \Z4${PRERELEASE}\Zn\"" >>"${TMP_PATH}/menu"
     echo "e \"$(TEXT "Exit")\"" >>"${TMP_PATH}/menu"
 
     dialog --backtitle "$(backtitle)" --colors \
@@ -1838,9 +1859,23 @@ function updateMenu() {
         fi
       fi
       ;;
+    b)
+      [ "${PRERELEASE}" = "false" ] && PRERELEASE='true' || PRERELEASE='false'
+      writeConfigKey "prerelease" "${PRERELEASE}" "${USER_CONFIG_FILE}"
+      NEXT="e"
+      ;;
     e) return ;;
     esac
   done
+}
+
+function notepadMenu() {
+  [ -d "${USER_UP_PATH}" ] || mkdir -p "${USER_UP_PATH}"
+  [ -f "${USER_UP_PATH}/notepad" ] || echo "$(TEXT "This person is very lazy and hasn't written anything.")" >"${USER_UP_PATH}/notepad"
+  dialog --backtitle "$(backtitle)" --colors --title "$(TEXT "Edit")" \
+    --editbox "${USER_UP_PATH}/notepad" 0 0 2>"${TMP_PATH}/notepad"
+  [ $? -ne 0 ] && return
+  mv "${TMP_PATH}/notepad" "${USER_UP_PATH}/notepad"
 }
 
 ###############################################################################
@@ -1879,6 +1914,7 @@ while true; do
     echo "c \"$(TEXT "Clean disk cache")\"" >>"${TMP_PATH}/menu"
   fi
   echo "p \"$(TEXT "Update menu")\"" >>"${TMP_PATH}/menu"
+  echo "t \"$(TEXT "Notepad")\"" >>"${TMP_PATH}/menu"
   echo "e \"$(TEXT "Exit")\"" >>"${TMP_PATH}/menu"
 
   dialog --backtitle "$(backtitle)" --colors \
@@ -1936,6 +1972,10 @@ while true; do
     ;;
   p)
     updateMenu
+    NEXT="d"
+    ;;
+  t)
+    notepadMenu
     NEXT="d"
     ;;
   e)
